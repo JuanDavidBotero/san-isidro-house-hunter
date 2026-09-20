@@ -1,0 +1,28 @@
+{
+  "fields": [
+    "canonical_address",
+    "source",
+    "url",
+    "first_seen",
+    "last_seen",
+    "status",
+    "price_usd",
+    "covered_m2",
+    "total_m2",
+    "garden_m2",
+    "bedrooms",
+    "bathrooms",
+    "private_pool",
+    "pool_potential",
+    "parking",
+    "units",
+    "expenses",
+    "condition",
+    "orientation",
+    "zone",
+    "owner_direct",
+    "fit_notes",
+    "risks",
+    "negotiation_notes"
+  ]
+}
