@@ -19,12 +19,22 @@ So fabrication is blocked structurally, in code, not by asking nicely:
 
   1. Every factual field must be accompanied by an `evidence` entry quoting the
      listing. A field without evidence is DROPPED before it reaches history --
-     see enforce_evidence(). The model cannot smuggle a number past this.
-  2. A record without a working public original URL is dropped entirely.
+     see enforce_evidence(). This is enforced in code, so inventing a number does not
+     fail loudly, it simply has no effect.
+  2. A record without a public original URL is dropped entirely. NOTE: the URL is
+     never fetched here, so it is checked for shape, not for existence. A dead link can
+     still reach the report; the link in the alert is what you click to confirm.
   3. A URL that looks like a search-results or listing-index page is dropped: the
      project requires original listing pages, never search URLs.
-  4. Output is validated against the packet contract, and anything unparseable is
-     reported rather than silently skipped.
+  4. Output is validated against the packet contract, and anything unparseable raises
+     rather than being silently skipped.
+  5. Fields a discovery pass must not produce at all are stripped: see
+     FORBIDDEN_FROM_SWEEP.
+
+  LIMIT worth stating plainly: the evidence check confirms that a quote EXISTS and is
+  not a restatement of the value. It cannot confirm the quote is really on the page,
+  because that would need a second fetch and a text match. So this raises the cost of
+  fabrication substantially; it does not make it impossible.
 
 Everything that survives is written in the same format `research/README.md` documents,
 so it flows through the existing normalise_record/ingest_record path unchanged and is
@@ -54,20 +64,80 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_PROMPT = ROOT / "prompts" / "sweep.md"
 AGENTS_FILE = ROOT / "AGENTS.md"
 
-# Facts that must be backed by an evidence quote. Identity and provenance fields
-# (source, url, observed_at) are exempt because they are not claims about the property.
+# Facts that must be backed by an evidence quote.
+#
+# This set is deliberately broad. An adversarial review found that anything left out
+# becomes a fabrication channel, because almost every field in this project feeds either
+# the alert text, the Priority A gate, or the dedup matcher:
+#
+#   canonical_address / zone / description -> hunter.infer_priority(), which decides
+#       Priority A, which is a hard requirement of is_act_now(). An invented "a 3 cuadras
+#       del Club Nautico" in a description was enough to put a property in front of the
+#       buyer.
+#   broker / broker_phone / photo_urls / distinctive_features / description -> the fuzzy
+#       dedup signals in hunter.fuzzy_score(). A zero-evidence record could score 0.86
+#       and be merged into an unrelated real listing, corrupting its history.
+#   risks -> printed verbatim in the alert's "Riesgos / pendientes" block.
+#
+# Only genuine non-claims are exempt: source, url, observed_at, fit_notes, evidence.
 EVIDENCE_REQUIRED = (
     hunter.NUMERIC_FIELDS
     | hunter.BOOLEAN_FIELDS
     | {"expenses", "condition", "orientation", "property_type", "street_quality",
-       "publication_date", "market_stage", "listing_state"}
+       "publication_date", "market_stage", "listing_state",
+       # Location claims: the most consequential field in the record.
+       "canonical_address", "zone",
+       # Dedup and alert-text inputs.
+       "description", "broker", "broker_phone", "photo_urls",
+       "distinctive_features", "risks"}
 )
 
+# Fields the sweep must never supply, regardless of evidence.
+#
+#   negotiation      A discovery pass has no business pricing a house. hunter.py renders
+#                    a supplied negotiation block under "Base verificada", and its own
+#                    gate is only that a free-text `basis` exists -- written by the same
+#                    model, in the same object. Stripping it here forces the honest
+#                    config-driven heuristic in hunter.negotiation_report() instead,
+#                    which labels itself an inference.
+#   source_listing_id  A hard identity alias in hunter.add_aliases(). One fabricated id
+#                    silently collapses two different houses into one history row.
+#                    The canonical URL is already a reliable alias.
+FORBIDDEN_FROM_SWEEP = ("negotiation", "source_listing_id")
+
+# An evidence quote must plausibly BE a quote. A one-character or echo-of-the-value
+# string satisfies a mere key-presence check while proving nothing.
+MIN_EVIDENCE_CHARS = 12
+
 # A URL that indexes many properties is not an original listing page.
+#
+# Detection is allowlist-FIRST, because a false positive here is worse than a false
+# negative: silently discarding a real candidate is invisible, while an index page that
+# slips through is obvious in the report. A pure blocklist is also dangerously easy to
+# get wrong -- "/propiedades/" looks like a search marker but appears in every ORIGINAL
+# Zonaprop URL (/propiedades/clasificado/...).
+#
+# An original listing page essentially always carries a listing id.
+ORIGINAL_URL_PATTERNS = (
+    r"/propiedades/clasificado/",          # zonaprop original listing
+    r"--\d{6,}",                           # argenprop: ...--12345678
+    r"/MLA-?\d{6,}",                       # mercadolibre item
+    r"-\d{7,}\.html?$",                    # generic portal slug ending in a listing id
+    r"/(propiedad|inmueble|ficha|detalle|listing|property)[/-]",
+)
+
 SEARCH_URL_MARKERS = (
-    "/searchresult", "search?", "/listado", "/busqueda", "/s/", "?q=", "&q=",
+    # generic search/index
+    "/searchresult", "search?", "/search/", "/busqueda", "/buscar", "/resultados",
+    "/listado", "/filtro", "/ordenar", "?q=", "&q=", "/s/", "_desde_",
+    # zonaprop index: /casas-venta-san-isidro.html
+    "-venta-san-isidro", "-venta-beccar", "-orden-",
+    # argenprop index: /casas/venta/san-isidro
+    "/casas/venta", "/casas/alquiler", "/departamentos/venta", "/inmuebles/venta",
+    # mercadolibre index
+    "/inmuebles/casas/", "/inmuebles/venta/",
+    # generic index slugs
     "/casas-en-venta", "/propiedades-en-venta", "/inmuebles-en-venta",
-    "/resultados", "/filtro", "/ordenar",
 )
 
 
@@ -110,6 +180,12 @@ def build_prompt(prompt_path: Path, max_results: int) -> str:
     brief = AGENTS_FILE.read_text(encoding="utf-8")
     task = prompt_path.read_text(encoding="utf-8")
     schema_fields = json.loads((ROOT / "listing_schema.json").read_text(encoding="utf-8"))
+    # listing_schema.json documents the full packet contract, including fields a HUMAN
+    # researcher may supply. Do not advertise the ones a sweep must never produce.
+    advertised = [
+        field for field in schema_fields.get("fields", [])
+        if field not in FORBIDDEN_FROM_SWEEP and field != "negotiation_notes"
+    ]
 
     return f"""You are the discovery stage of a real-estate radar. Search the public web
 and return structured findings. You are NOT writing a report for a human -- your entire
@@ -117,6 +193,18 @@ output is consumed by a program.
 
 === BUYER BRIEF ===
 {brief}
+
+=== WHICH PARTS OF THAT BRIEF ARE YOURS ===
+The brief above describes the whole radar, not only your stage. You are DISCOVERY. Your
+job is to find candidates and record evidence.
+
+These parts of the brief are handled by the program that consumes your output, so do not
+attempt them and do not let them shape your JSON:
+  - Freshness: NEW / MATERIAL_CHANGE / OLD / DUPLICATE / UNCERTAIN. You are stateless and
+    cannot know what was seen before. Report everything you find.
+  - Negotiation: asking price versus probable range, target, opening offer, maximum
+    justified price. Do NOT estimate these. The program computes them from config.
+  - The alert format, the ACT NOW decision, and the daily report.
 
 === THIS RUN ===
 {task}
@@ -179,14 +267,23 @@ Each <record>:
   REQUIRED: "source" (site/agency name), "url" (the ORIGINAL listing page, never a
   search-results URL), "canonical_address" (as published).
 
+  "canonical_address" also NEEDS its own "evidence" entry, quoting the location wording
+  the page prints. It is the field the Priority A gate reads, so it is treated as a
+  factual claim, not as an identity label: without an evidence quote it is dropped and
+  the whole record is then discarded for having no address.
+
   OPTIONAL, include ONLY what the page actually states:
-{json.dumps(schema_fields.get("fields", []), indent=4)}
+{json.dumps(advertised, indent=4)}
   plus: price_usd, covered_m2, total_m2, garden_m2, bedrooms, bathrooms, parking,
   units, expenses, expenses_ars, private_garden, private_pool, pool_potential,
   controlled_entrance, condition, property_type, street_quality, description, broker,
   broker_phone, photo_urls, distinctive_features, publication_date, market_stage,
   owner_direct, exceptional_layout, high_traffic, large_development,
   needs_major_renovation, security_concern, flood_risk.
+
+  DO NOT emit "negotiation" or "source_listing_id". Discovery does not price a house,
+  and a guessed listing id silently merges two different properties. Both are stripped
+  by the consuming program, so supplying them is wasted effort.
 
 === THE RULE THAT MATTERS MOST ===
 Every factual field you include MUST have a matching entry in that record's
@@ -195,9 +292,14 @@ Every factual field you include MUST have a matching entry in that record's
   "covered_m2": 170,
   "expenses_ars": 185000,
   "evidence": {{
+    "canonical_address": "Breadcrumb reads 'San Isidro > Lasalle', title 'Casa en Juan Bautista de Lasalle 1600'.",
     "covered_m2": "Listing states '170 m2 cubiertos'.",
     "expenses_ars": "Listing states 'Expensas $185.000'."
   }}
+
+Each evidence value must be a real quote or close paraphrase of at least a dozen
+characters. A single character, or the value echoed back ("170"), does not count and the
+field is dropped.
 
 A field without evidence WILL BE DISCARDED by the consuming program, so including one
 is wasted effort. If the page does not state something, OMIT the field. Do not infer,
@@ -212,18 +314,40 @@ volume: three well-evidenced Priority A candidates beat twenty vague ones.
 """
 
 
-def run_claude(prompt: str, timeout: int, verbose: bool) -> str:
-    binary = claude_binary()
-    command = [
+# Tools the sweep agent may use, and the ones it must never be able to reach.
+#
+# An earlier version passed --permission-mode bypassPermissions, which does NOT restrict
+# the tool set -- it approves everything. Combined with --allowedTools it reads like a
+# sandbox while actually granting Bash, Write and Edit to an unattended agent running in
+# a directory whose .env holds live credentials. That was wrong.
+#
+# So: an explicit deny-list, and no blanket bypass. The sweep only reads the web.
+SWEEP_ALLOWED_TOOLS = "WebSearch,WebFetch"
+SWEEP_DENIED_TOOLS = "Bash,Write,Edit,NotebookEdit,Task,Agent,Workflow"
+
+
+def build_command(binary: str, prompt: str) -> list[str]:
+    """The single definition of how the CLI is invoked, so the sweep and the --check-tools
+    diagnostic cannot drift apart on their permission policy."""
+    return [
         binary,
         "-p",
         prompt,
         "--output-format", "text",
-        "--allowedTools", "WebSearch,WebFetch",
-        "--permission-mode", "bypassPermissions",
+        "--allowedTools", SWEEP_ALLOWED_TOOLS,
+        "--disallowedTools", SWEEP_DENIED_TOOLS,
     ]
+
+
+def run_claude(prompt: str, timeout: int, verbose: bool) -> str:
+    binary = claude_binary()
+    command = build_command(binary, prompt)
     if verbose:
-        print(f"running: {binary} -p <prompt> --allowedTools WebSearch,WebFetch", file=sys.stderr)
+        print(
+            f"running: {binary} -p <prompt> "
+            "--allowedTools WebSearch,WebFetch --disallowedTools Bash,Write,Edit,...",
+            file=sys.stderr,
+        )
 
     # Proxy handling, settled empirically rather than by reasoning.
     #
@@ -299,24 +423,84 @@ def extract_json(raw: str) -> dict[str, Any]:
 
 
 def is_search_url(url: str) -> bool:
+    """True when the URL indexes many properties rather than being one listing page.
+
+    Allowlist first: if the URL carries a listing id in a known original-page shape, it
+    is a listing page even if it also contains an index-looking substring.
+    """
     lowered = url.lower()
+    if any(re.search(pattern, lowered) for pattern in ORIGINAL_URL_PATTERNS):
+        return False
     return any(marker in lowered for marker in SEARCH_URL_MARKERS)
 
 
+def is_real_evidence(value: Any, claimed: Any) -> bool:
+    """Reject evidence that satisfies a key-presence check while proving nothing.
+
+    A bare "x", or a string that is just the value echoed back ("170"), is not a quote
+    from a listing. This does not and cannot verify that the quote is genuine -- only a
+    fetch of the page could -- but it removes the cheapest way past the guard.
+    """
+    text = clean_text(value)
+    if not text or len(text) < MIN_EVIDENCE_CHARS:
+        return False
+    # "170" as evidence for covered_m2=170 is a restatement, not a source.
+    return text.strip() != str(claimed).strip()
+
+
+def coerce_types(record: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Drop fields hunter.normalise_record would reject, instead of letting one bad
+    field abort the whole packet.
+
+    hunter.parse_number/parse_bool raise HunterError on malformed input, and
+    hunter.command_ingest aborts the entire import on the first raise. Since the packet
+    file is appended to and persists, a single malformed field from one sweep would
+    poison every later run over the same file -- losing every other genuine find. So
+    each value is pre-flighted here and dropped individually if it will not survive.
+    """
+    cleaned = dict(record)
+    dropped: list[str] = []
+    for field in list(cleaned):
+        value = cleaned[field]
+        if value is None:
+            continue
+        try:
+            if field in hunter.NUMERIC_FIELDS:
+                hunter.parse_number(value, field)
+            elif field in hunter.BOOLEAN_FIELDS:
+                hunter.parse_bool(value, field)
+            elif field in {"photo_urls", "distinctive_features", "risks"}:
+                hunter.clean_list(value, field)
+        except HunterError:
+            cleaned.pop(field)
+            dropped.append(field)
+    return cleaned, dropped
+
+
 def enforce_evidence(record: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Drop every factual field that lacks a supporting evidence entry.
+    """Drop every factual field that lacks a supporting evidence quote.
 
     This is the structural anti-fabrication guard. The prompt asks the model not to
     invent facts; this makes inventing them ineffective, which is a much stronger
     guarantee than asking.
+
+    It also strips the fields a discovery pass must never supply at all: see
+    FORBIDDEN_FROM_SWEEP.
     """
     evidence = record.get("evidence")
     evidence = evidence if isinstance(evidence, dict) else {}
-    supported = {key for key, value in evidence.items() if clean_text(value)}
     dropped: list[str] = []
     cleaned = dict(record)
+
+    for field in FORBIDDEN_FROM_SWEEP:
+        if field in cleaned:
+            cleaned.pop(field)
+            dropped.append(field)
+
     for field in list(cleaned):
-        if field in EVIDENCE_REQUIRED and field not in supported:
+        if field in EVIDENCE_REQUIRED and not is_real_evidence(
+            evidence.get(field), cleaned.get(field)
+        ):
             cleaned.pop(field)
             dropped.append(field)
     return cleaned, dropped
@@ -329,7 +513,7 @@ def validate_records(payload: dict[str, Any], verbose: bool) -> tuple[list[dict[
 
     kept: list[dict[str, Any]] = []
     counts = {"received": len(listings), "no_url": 0, "search_url": 0, "no_address": 0,
-              "unparseable": 0, "fields_dropped": 0}
+              "unparseable": 0, "fields_dropped": 0, "bad_types_dropped": 0}
 
     for raw in listings:
         if not isinstance(raw, dict):
@@ -346,17 +530,29 @@ def validate_records(payload: dict[str, Any], verbose: bool) -> tuple[list[dict[
             if verbose:
                 print(f"  dropped search-results URL: {url[:90]}", file=sys.stderr)
             continue
-        if not clean_text(raw.get("canonical_address")):
-            counts["no_address"] += 1
-            continue
 
         record, dropped = enforce_evidence(raw)
         counts["fields_dropped"] += len(dropped)
         if dropped and verbose:
             print(f"  {url[:60]}: dropped unevidenced {', '.join(sorted(dropped))}", file=sys.stderr)
 
+        # Pre-flight types AFTER the evidence pass, so a malformed value cannot abort
+        # the ingest of the whole packet later.
+        record, bad_types = coerce_types(record)
+        counts["bad_types_dropped"] += len(bad_types)
+        if bad_types and verbose:
+            print(f"  {url[:60]}: dropped malformed {', '.join(sorted(bad_types))}", file=sys.stderr)
+
+        # Checked after the evidence pass: an unevidenced address is dropped above, and
+        # hunter.py withholds an alert without one, so there is nothing to keep.
+        if not clean_text(record.get("canonical_address")):
+            counts["no_address"] += 1
+            continue
+
         record["source"] = clean_text(record.get("source")) or "Web sweep"
-        record.setdefault("observed_at", iso_now())
+        # Stamped, not setdefault: a model-supplied past date would place the record
+        # before the report's `since` cutoff and hide it from every report.
+        record["observed_at"] = iso_now()
         record.setdefault("market_stage", "listed")
         # Record how this was found, so a sweep-sourced fact is auditable later.
         record["fit_notes"] = " ".join(
@@ -399,9 +595,7 @@ def command_check_tools(args: argparse.Namespace) -> int:
                 environment.pop(variable, None)
         try:
             completed = subprocess.run(
-                [binary, "-p", probe, "--output-format", "text",
-                 "--allowedTools", "WebSearch,WebFetch",
-                 "--permission-mode", "bypassPermissions"],
+                build_command(binary, probe),
                 capture_output=True, text=True, timeout=args.timeout, env=environment,
             )
         except subprocess.TimeoutExpired:
@@ -426,6 +620,9 @@ def command_check_tools(args: argparse.Namespace) -> int:
 
 
 def command_sweep(args: argparse.Namespace) -> int:
+    # Read every config BEFORE the sweep. A config error discovered afterwards would
+    # throw away a completed 15-minute search and every listing in it.
+    targeting = hunter.read_config(Path(args.config))
     prompt = build_prompt(Path(args.prompt), args.max_results)
     if args.print_prompt:
         print(prompt)
@@ -443,7 +640,6 @@ def command_sweep(args: argparse.Namespace) -> int:
 
     # Apply the same Priority A/B geography filter the API path uses, so both
     # discovery routes agree on what counts as on-target.
-    targeting = hunter.read_config(Path(args.config))
     on_target = [record for record in records if fetch_ml.relevant(record, targeting)]
     counts["off_target"] = len(records) - len(on_target)
 

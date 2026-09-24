@@ -54,28 +54,46 @@ unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy 2>/dev/n
 
 TODAY="$($PYTHON -c 'import hunter; print(hunter.local_now().date().isoformat())')"
 
-echo "== 1/4 init history =="
-$PYTHON hunter.py init
+# A failed run must never look like a quiet market. `set -e` would abort silently from a
+# launchd job whose output nobody reads, so any failure is announced on the urgent
+# channel before exiting non-zero.
+on_failure() {
+  local stage="$1"
+  echo "FAILED at: ${stage}" >&2
+  if [ -z "$DRY_RUN" ]; then
+    $PYTHON notify.py --force-telegram --text "⚠️ San Isidro radar FAILED on ${TODAY} at: ${stage}.
+Today's silence is NOT evidence that the market was quiet.
+Log: $(pwd)/logs/radar.log" >/dev/null 2>&1 || true
+  fi
+  exit 1
+}
 
-# Discovery. The agentic sweep is the primary path: MercadoLibre's search API is closed
-# to third-party apps (a valid user token is still refused by their PolicyAgent), so the
-# ML client is kept only for the --probe/--auth-check diagnostics and for future
-# enrichment if that ever changes.
+echo "== 1/4 init history =="
+$PYTHON hunter.py init || on_failure "history init"
+
+# Discovery. The agentic sweep is the primary path: MercadoLibre's API is closed to
+# third-party apps for listing data (403 PA_UNAUTHORIZED_RESULT_FROM_POLICIES on search
+# AND on single-item lookup, with both app- and user-context tokens), so fetch_ml.py is
+# kept only for its OAuth diagnostics and the shared packet helpers.
 echo "== 2/4 discover (public-web sweep) =="
-DISCOVERY="$($PYTHON sweep.py ${SWEEP_ARGS:-})"
+DISCOVERY="$($PYTHON sweep.py ${SWEEP_ARGS:-})" || on_failure "discovery sweep"
 echo "$DISCOVERY"
-PACKET="$($PYTHON -c "import json,sys; print(json.loads(sys.argv[1])['packet'])" "$DISCOVERY")"
+PACKET="$($PYTHON -c "import json,sys; print(json.loads(sys.argv[1])['packet'])" "$DISCOVERY")" \
+  || on_failure "reading the packet path from the sweep result"
 
 echo "== 3/4 ingest =="
 if [ -s "$PACKET" ]; then
-  $PYTHON hunter.py ingest --input "$PACKET"
+  # An ingest abort is the dangerous case: hunter.py rejects the whole packet on one
+  # malformed record, so without this guard the run would continue to the report stage
+  # and cheerfully deliver "NO CHANGE".
+  $PYTHON hunter.py ingest --input "$PACKET" || on_failure "ingest of ${PACKET}"
 else
   echo "empty packet; nothing to ingest"
 fi
 
 echo "== 4/4 report and deliver =="
 mkdir -p reports
-$PYTHON notify.py --save "reports/${TODAY}.md" $DRY_RUN
+$PYTHON notify.py --save "reports/${TODAY}.md" $DRY_RUN || on_failure "report delivery"
 
 echo
 echo "== report =="

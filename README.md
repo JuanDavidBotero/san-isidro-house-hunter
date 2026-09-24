@@ -329,7 +329,7 @@ git push origin --delete state   # start history over from empty
 ### Tests
 
 ```sh
-PYTHONPATH=.:tests python3 -m unittest test_hunter test_automation test_sweep
+PYTHONPATH=.:tests python3.13 -m unittest test_hunter test_automation test_sweep
 ```
 
 ## Codex

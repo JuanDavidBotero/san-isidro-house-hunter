@@ -711,7 +711,15 @@ def load_packet(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
             raw = json.loads(line)
         except json.JSONDecodeError as exc:
             raise HunterError(f"{path}:{line_number}: invalid JSON") from exc
-        yield line_number, normalise_record(raw)
+        # normalise_record is called here rather than at the call site, so its failures
+        # must carry the line number too. Without this, a single malformed field aborts
+        # the whole packet with no indication of WHICH line to fix, and the packet is
+        # appended to daily, so the poison persists across runs.
+        try:
+            record = normalise_record(raw)
+        except HunterError as exc:
+            raise HunterError(f"{path}:{line_number}: {exc}") from exc
+        yield line_number, record
 
 
 def is_meaningful(record: dict[str, Any], evaluation: dict[str, Any], config: dict[str, Any]) -> bool:
@@ -838,9 +846,14 @@ def negotiation_report(record: dict[str, Any], config: dict[str, Any]) -> str:
         )
     price_range = estimate.get("probable_range_usd")
     range_text = f"USD {price_range[0]:,.0f}–USD {price_range[1]:,.0f}" if price_range else "No estimado."
+    # "Base declarada", not "Base verificada". `basis` is free text supplied alongside the
+    # figures it justifies, so nothing here has been independently verified. AGENTS.md
+    # requires facts, agent claims, and inferences to be labelled distinctly, and every
+    # other unconfirmed value in this alert prints "No verificado." -- claiming
+    # verification for the one block a model could author would invert that.
     return "\n".join(
         [
-            f"- Base verificada: {estimate.get('basis') or 'No verificada.'}",
+            f"- Base declarada (no verificada): {estimate.get('basis') or 'No declarada.'}",
             f"- Precio estimado de cierre: {range_text}",
             f"- Objetivo realista: {format_money(estimate.get('realistic_target_usd'))}",
             f"- Oferta inicial sugerida: {format_money(estimate.get('suggested_opening_offer_usd'))}",

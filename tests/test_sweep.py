@@ -24,6 +24,7 @@ def record(**changes):
         "covered_m2": 170,
         "private_pool": True,
         "evidence": {
+            "canonical_address": "Listing title reads 'Casa en Juan Bautista de Lasalle 1600, San Isidro'.",
             "price_usd": "Listing states 'USD 340.000'.",
             "covered_m2": "Listing states '170 m2 cubiertos'.",
             "private_pool": "Listing description mentions 'pileta propia'.",
@@ -63,9 +64,13 @@ class EvidenceEnforcementTests(unittest.TestCase):
         )
         self.assertNotIn("price_usd", cleaned)
         self.assertNotIn("bedrooms", cleaned)
-        # Identity fields are not claims about the property and must be preserved.
+        # source and url are provenance, not claims about the property, so they survive.
         self.assertEqual(cleaned["url"], "https://x/y")
-        self.assertEqual(cleaned["canonical_address"], "A")
+        self.assertEqual(cleaned["source"], "X")
+        # canonical_address IS a claim: it drives the Priority A gate, so an unevidenced
+        # address is dropped like any other invented fact.
+        self.assertNotIn("canonical_address", cleaned)
+        self.assertIn("canonical_address", dropped)
         self.assertIn("price_usd", dropped)
 
     def test_dropped_fields_render_as_not_verified_downstream(self):
