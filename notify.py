@@ -12,7 +12,7 @@ That asymmetry is the whole point. A radar that pings your phone every single da
 muted inside a week, and a muted radar is worse than no radar because it looks like it
 is working. The daily email remains the proof-of-life that the job actually ran.
 
-Credentials come from the environment, never from a file in the repo:
+Credentials come from the environment, or from a gitignored local .env:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO
 A channel with missing credentials is skipped with a warning, not a crash: losing the
@@ -36,6 +36,9 @@ from typing import Optional
 
 import hunter
 from hunter import HunterError, local_now
+
+# Credentials come from .env so a new shell or a launchd job still has them.
+hunter.load_dotenv()
 
 ROOT = Path(__file__).resolve().parent
 NO_CHANGE = "NO CHANGE — nothing worth visiting today."

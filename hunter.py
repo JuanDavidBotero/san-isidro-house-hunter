@@ -52,6 +52,30 @@ class HunterError(ValueError):
     """An input packet cannot be safely interpreted as evidence."""
 
 
+def load_dotenv(path: Path | None = None) -> None:
+    """Populate os.environ from a local .env file, without overwriting real env vars.
+
+    Credentials live in .env (gitignored) rather than in exported shell variables,
+    because a new terminal tab loses exports and a launchd job inherits almost no
+    environment at all. An existing environment variable always wins, so a one-off
+    override on the command line still works.
+    """
+    import os
+
+    env_path = path or (ROOT / ".env")
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def local_now() -> datetime:
     return datetime.now(ARGENTINA_TZ)
 

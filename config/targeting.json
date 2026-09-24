@@ -1,4 +1,12 @@
 {
+  "_notes": {
+    "matching": "priority and exclusion terms are substring-matched after accent folding and lowercasing (hunter.text_key), so an accented duplicate of an existing term is a no-op and a short term can match inside an unrelated word.",
+    "exclusion_terms_are_hard_rejects": "hunter.is_meaningful() returns False whenever evaluate() produced any exclusion, so every entry in exclusion_terms is a hard reject and its weight only shapes the displayed fit score. Only unambiguous, property-level disqualifiers belong here. Ambiguous prose is left to the evidence-backed structured fields: large_development, units, expenses_ars, needs_major_renovation, high_traffic, security_concern.",
+    "priority_a_search_slots": "hunter.research_plan() puts only the FIRST SEVEN priority_a_terms into the generated Priority A query, so entries 1-7 are ordered for search value and the later entries are spelling variants and landmarks kept for matching only.",
+    "priority_terms_are_the_discovery_gate": "fetch_ml.relevant() drops any swept record that matches no priority term, so a missing area name silently discards listings rather than merely downgrading them.",
+    "price_bands": "ideal_price_usd and strong_price_usd are documentation; the 300k and 350k band edges are hardcoded in hunter.evaluate(). Keep them in sync by hand.",
+    "peso_thresholds_drift": "expenses_review_ars and expenses_reject_ars are nominal pesos, so Argentine inflation erodes them into hard rejects of ordinary listings. Re-check both against observed expensas in current Beccar and San Isidro listings before trusting them; they were not re-verified in this pass."
+  },
   "price_ceiling_usd": 380000,
   "price_investigate_ceiling_usd": 410000,
   "ideal_price_usd": [240000, 300000],
@@ -14,30 +22,34 @@
     "round_to_usd": 1000
   },
   "priority_a_terms": [
-    "club nautico san isidro",
-    "club náutico san isidro",
-    "holy cross",
-    "bajo san isidro",
     "lasalle",
     "san isidro chico",
     "los cardos",
+    "holy cross",
+    "bajo san isidro",
+    "club nautico san isidro",
     "boating club",
-    "juan bautista de lasalle"
+    "la salle",
+    "juan bautista de lasalle",
+    "juan bautista de la salle",
+    "bajo de san isidro",
+    "club nautico de san isidro",
+    "puerto de san isidro",
+    "villa ocampo"
   ],
   "priority_b_terms": [
     "lomas de san isidro",
     "beccar vias",
-    "beccar vías",
-    "libertador",
-    "la horqueta"
+    "la horqueta",
+    "beccar"
   ],
   "exclusion_terms": {
     "ph": 25,
-    "duplex": 20,
-    "dúplex": 20,
     "a refaccionar": 25,
     "a reciclar": 25,
-    "gran condominio": 30,
-    "barrio cerrado": 10
+    "demoler": 30,
+    "apto constructor": 30,
+    "apto emprendimiento": 28,
+    "gran condominio": 30
   }
 }

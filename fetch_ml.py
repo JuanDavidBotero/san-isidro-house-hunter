@@ -1,25 +1,46 @@
 #!/usr/bin/env python3
-"""Automated discovery pass: MercadoLibre public API -> research JSONL packet.
+"""MercadoLibre API client -- DORMANT for discovery. See the verdict below.
 
-This is the piece that makes the radar unattended. `hunter.py` deliberately does not
-touch portals; it consumes `research/YYYY-MM-DD.jsonl`. Until now a human had to write
-that file. This module produces it from MercadoLibre's public REST API, which is the
-one named source with a documented, permitted programmatic interface.
+!! MercadoLibre's API cannot supply listing data to this project. !!
 
-Discipline this module inherits from the rest of the project:
+Measured on 2026-09-23 with a valid user-context token (authorization_code + PKCE,
+scopes including `read` and `offline_access`), via tools/ml_probe.py:
+
+    200  /users/me                      identity works
+    200  /categories/MLA1459            public metadata, works even unauthenticated
+    403  /sites/MLA/search  (all variants: category, q, seller_id, unauthenticated)
+    403  /items/{id}                    so no per-listing enrichment either
+    403  /users/{self}/items/search
+    403  /sites/MLA/domain_discovery/search
+    403  /trends/MLA/MLA1459
+
+Every 403 is `PA_UNAUTHORIZED_RESULT_FROM_POLICIES` from their PolicyAgent. Both an
+app-context token (client_credentials) and a user-context token are refused, so this is
+a deliberate platform restriction on third-party access, not a scope or auth mistake.
+Re-running the OAuth flow will not change it.
+
+Discovery therefore lives in sweep.py. This module is kept for three reasons:
+
+  1. `--probe`, `--auth-check`, `--auth-login`, `--try-client-credentials` remain useful
+     diagnostics, and re-verify cheaply if MercadoLibre ever reopens access.
+  2. `packet_path()`, `write_packet()` and `relevant()` are the shared packet helpers
+     that sweep.py uses. They are source-agnostic and belong to the packet contract,
+     not to MercadoLibre.
+  3. `map_item()` and its tests encode a correct ML-item -> packet mapping. If access
+     returns, discovery is one function call away rather than a rewrite.
+
+Everything below still honours the project's evidence discipline:
 
   * It never invents a fact. A MercadoLibre attribute that is absent becomes null,
     which `hunter.py` renders as "Not verified."
   * It never reads facts out of the free-text description. Only the attribute ids
     listed in config/mercadolibre.json are trusted.
   * `price_usd` is written only when MercadoLibre reports currency_id == "USD".
-    An ARS asking price is recorded as `price_ars` and left out of `price_usd`,
+    An ARS asking price is recorded separately and left out of `price_usd`,
     because silently mixing the two would corrupt every downstream price test.
   * Every emitted value records its origin in `evidence`, so no number reaches an
     alert without a traceable source.
 
-It sends no credentials unless ML_CLIENT_ID / ML_CLIENT_SECRET are set, respects a
-configurable delay between requests, and identifies itself with a real User-Agent.
 It does not bypass CAPTCHAs, logins, or rate limits; on HTTP 401/403 it reports the
 condition and exits rather than retrying around it.
 """
@@ -31,17 +52,22 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from pathlib import Path
 from typing import Any, Optional
 
 import hunter
 from hunter import HunterError, clean_text, iso_now, local_now, text_key
+
+# Credentials come from .env so a new shell or a launchd job still has them.
+hunter.load_dotenv()
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_ML_CONFIG = ROOT / "config" / "mercadolibre.json"
@@ -157,14 +183,12 @@ def store_refresh_token(token: str) -> None:
 
 
 def access_token() -> Optional[str]:
-    """Obtain a bearer token via MercadoLibre's documented refresh_token flow.
+    """Obtain a bearer token, preferring a stored refresh token.
 
-    MercadoLibre supports exactly two grant types: authorization_code and
-    refresh_token (their error reference lists `unsupported_grant_type` for anything
-    else, so there is no client_credentials shortcut and no point attempting one).
-
-    That means a one-time interactive browser authorization is unavoidable. After it,
-    every scheduled run trades the stored refresh token for a fresh access token.
+    MercadoLibre's auth guide documents authorization_code and refresh_token, while
+    the app-creation console also offers a Client Credentials flow. Since the two
+    disagree, this tries both: a stored refresh token first, then client_credentials
+    as a fallback. Use `--try-client-credentials` to find out which your app supports.
 
     The critical operational detail, straight from their docs: a refresh token is
     SINGLE USE. Each refresh invalidates it and returns a replacement, and only the
@@ -180,11 +204,26 @@ def access_token() -> Optional[str]:
 
     refresh = stored_refresh_token()
     if not refresh:
-        raise HunterError(
-            "ML_CLIENT_ID/SECRET are set but no refresh token is available. "
-            "MercadoLibre requires a one-time browser authorization: run "
-            "`python3.13 fetch_ml.py --auth-url` and follow the steps."
-        )
+        # MercadoLibre's auth guide lists only authorization_code and refresh_token
+        # under unsupported_grant_type, but the app-creation form offers a
+        # "Client Credentials" flow. The documentation and the console disagree, so
+        # try it rather than assume: when it works it removes the browser step and
+        # all of the single-use rotation machinery below.
+        try:
+            payload = token_request(
+                {
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                }
+            )
+        except HunterError as exc:
+            raise HunterError(
+                "No refresh token is available and client_credentials was refused "
+                f"({exc}). Run `python3.13 fetch_ml.py --auth-url` for the one-time "
+                "browser authorization."
+            ) from exc
+        return str(payload["access_token"])
 
     payload = token_request(
         {
@@ -563,29 +602,68 @@ def command_auth_url(args: argparse.Namespace) -> int:
     state = secrets.token_urlsafe(16)
     store_pkce(verifier, state)
 
-    params = urllib.parse.urlencode(
-        {
-            "response_type": "code",
-            "client_id": client_id,
-            "redirect_uri": redirect,
-            "state": state,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-        }
-    )
+    query = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect,
+        "state": state,
+    }
+    if not args.no_pkce:
+        query["code_challenge"] = challenge
+        query["code_challenge_method"] = "S256"
+    params = urllib.parse.urlencode(query)
+    exchange_flags = " --no-pkce" if args.no_pkce else ""
     print(
         "Open this URL in a browser, signed in as the ACCOUNT ADMINISTRATOR\n"
         "(a collaborator/operator account cannot grant access -- MercadoLibre returns\n"
         "invalid_operator_user_id):\n\n"
         f"  https://auth.mercadolibre.com.ar/authorization?{params}\n\n"
-        "You will be redirected to:\n"
+        "You will be redirected to a page that fails to load. That is expected -- the\n"
+        "code is in the browser's ADDRESS BAR, not on the page:\n"
         f"  {redirect}?code=TG-xxxxx&state={state}\n\n"
-        "That page will fail to load. That is expected -- you only need the code.\n"
-        "Confirm the state matches the value above, then exchange the code within\n"
-        "about 10 minutes:\n\n"
-        "  python3.13 fetch_ml.py --exchange-code TG-xxxxx\n"
+        "Copy the value after code=, stopping before any &, then run this IMMEDIATELY\n"
+        "(the code is single-use and expires in about 10 minutes):\n\n"
+        f"  python3.13 fetch_ml.py --exchange-code PASTE_CODE_HERE{exchange_flags}\n\n"
+        "Do not re-run --auth-url before exchanging: each run generates a new PKCE\n"
+        "verifier and invalidates the previous URL.\n"
     )
     return 0
+
+
+def clean_authorization_code(raw: str) -> str:
+    """Validate the pasted authorization code and strip common copy artifacts.
+
+    MercadoLibre codes are TG-<hex>-<numeric user id>. Selecting a code out of a
+    browser address bar very easily grabs one extra character from the following
+    query parameter, and ML answers that with an opaque `invalid_grant` that looks
+    identical to an expired code. Catching it here saves a round trip through the
+    whole browser flow.
+    """
+    code = (raw or "").strip().strip("'\"")
+    # A full URL pasted instead of just the code.
+    if "code=" in code:
+        parsed = urllib.parse.parse_qs(urllib.parse.urlsplit(code).query)
+        if parsed.get("code"):
+            code = parsed["code"][0]
+    code = code.split("&")[0].strip()
+
+    match = re.fullmatch(r"(TG-[0-9a-fA-F]+-\d+)([A-Za-z]*)", code)
+    if not match:
+        raise HunterError(
+            f"'{code}' does not look like a MercadoLibre authorization code.\n"
+            "Expected the form TG-<hex>-<numeric user id>, for example\n"
+            "TG-0000000000000000000000aa-12345678\n"
+            "Copy strictly between 'code=' and the next '&' in the address bar."
+        )
+    cleaned, trailing = match.group(1), match.group(2)
+    if trailing:
+        print(
+            f"note: dropped trailing '{trailing}' from the code -- MercadoLibre codes "
+            f"end in a numeric user id, so that character came from the next query\n"
+            f"parameter (probably &state=...). Using: {cleaned}",
+            file=sys.stderr,
+        )
+    return cleaned
 
 
 def command_exchange_code(args: argparse.Namespace) -> int:
@@ -603,14 +681,55 @@ def command_exchange_code(args: argparse.Namespace) -> int:
         "grant_type": "authorization_code",
         "client_id": client_id,
         "client_secret": client_secret,
-        "code": args.exchange_code,
+        "code": clean_authorization_code(args.exchange_code),
         "redirect_uri": redirect,
     }
-    verifier = load_pkce_verifier()
+    verifier = None if args.no_pkce else load_pkce_verifier()
     if verifier:
         fields["code_verifier"] = verifier
 
-    payload = token_request(fields)
+    # PKCE is per-app optional. If the app does not have it enabled, sending a
+    # code_verifier can itself cause invalid_grant -- and so can a stale verifier from
+    # an earlier --auth-url run. Retrying without it isolates PKCE as the cause
+    # instead of leaving you to guess between three identical-looking failures.
+    try:
+        payload = token_request(fields)
+    except HunterError as exc:
+        if verifier and "invalid_grant" in str(exc):
+            print(
+                "First attempt failed with invalid_grant. Retrying without PKCE, in\n"
+                "case the app does not have it enabled or the stored verifier is stale...",
+                file=sys.stderr,
+            )
+            fields.pop("code_verifier", None)
+            try:
+                payload = token_request(fields)
+            except HunterError as retry_exc:
+                if "code_verifier is a required parameter" in str(retry_exc):
+                    raise HunterError(
+                        "This app REQUIRES PKCE, so the retry without it was rejected.\n"
+                        "The first attempt did send a verifier and still failed, which "
+                        "means the code itself was bad -- almost always expired (~10 min) "
+                        "or already used.\n\n"
+                        "Use the single-step flow, which leaves no window for the code to "
+                        "expire:\n"
+                        "  python3.13 fetch_ml.py --auth-login"
+                    ) from retry_exc
+                raise HunterError(
+                    f"{retry_exc}\n\n"
+                    "Both attempts failed. In order of "
+                    "likelihood:\n"
+                    "  1. The code expired (~10 min) or was already used. Codes are "
+                    "single-use -- run --auth-url again and exchange immediately.\n"
+                    "  2. ML_REDIRECT_URI does not match the app's registered Redirect "
+                    f"URI exactly. Currently sending: {redirect}\n"
+                    "  3. You authorized with a collaborator account rather than the "
+                    "account administrator."
+                ) from retry_exc
+            print("Retry without PKCE succeeded. Disable 'Requiere PKCE' on the app, "
+                  "or always pass --no-pkce.", file=sys.stderr)
+        else:
+            raise
     refresh = payload.get("refresh_token")
     if not refresh:
         print(
@@ -642,6 +761,196 @@ def command_exchange_code(args: argparse.Namespace) -> int:
         "persists the rotated value, and note it expires after 6 months.",
         file=sys.stderr,
     )
+    return 0
+
+
+def command_try_client_credentials(args: argparse.Namespace) -> int:
+    """Test whether this app can use client_credentials, and whether search accepts it.
+
+    Worth knowing before committing to the interactive flow: client_credentials is
+    stateless, so it needs no browser step, no single-use token rotation, and no PAT
+    in CI. Getting a token is not sufficient, though -- the token also has to be
+    accepted for search, so both are checked.
+    """
+    client_id = os.environ.get("ML_CLIENT_ID")
+    client_secret = os.environ.get("ML_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        print("error: set ML_CLIENT_ID and ML_CLIENT_SECRET first", file=sys.stderr)
+        return 2
+
+    print("1. Requesting a token with grant_type=client_credentials...")
+    try:
+        payload = token_request(
+            {
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            }
+        )
+    except HunterError as exc:
+        detail = str(exc)
+        print(f"   REFUSED: {detail}\n", file=sys.stderr)
+        # invalid_client and unsupported_grant_type mean completely different things.
+        # Reporting "this flow is unavailable" for a mistyped secret would send you
+        # down the wrong path entirely.
+        if "invalid_client" in detail:
+            print(
+                "That is a CREDENTIALS error, not a verdict on the flow.\n"
+                "MercadoLibre rejected the client_id/client_secret pair itself, so\n"
+                "client_credentials has not actually been tested yet.\n\n"
+                "Check that ML_CLIENT_SECRET holds the real Secret Key (not a\n"
+                "placeholder), has no surrounding quotes or whitespace, and belongs to\n"
+                f"app {client_id}. Then re-run this command.",
+                file=sys.stderr,
+            )
+        elif "unsupported_grant_type" in detail:
+            print(
+                "This app cannot use client_credentials -- MercadoLibre rejected the\n"
+                "grant type itself. Enable the flow in the app settings, or use the\n"
+                "browser flow:\n"
+                "  python3.13 fetch_ml.py --auth-url",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Use the browser flow instead:\n"
+                "  python3.13 fetch_ml.py --auth-url",
+                file=sys.stderr,
+            )
+        return 1
+    print(f"   OK. scope={payload.get('scope')!r} expires_in={payload.get('expires_in')}")
+
+    print("2. Calling search with that token...")
+    ml_config = read_ml_config(Path(args.ml_config))
+    try:
+        result = api_get(
+            f"/sites/{ml_config['site']}/search",
+            {"category": ml_config["category"], "limit": 1},
+            ml_config,
+            str(payload["access_token"]),
+        )
+    except HunterError as exc:
+        print(f"   REFUSED: {exc}\n", file=sys.stderr)
+        print(
+            "The token is valid but search rejects it. Use the browser flow:\n"
+            "  python3.13 fetch_ml.py --auth-url",
+            file=sys.stderr,
+        )
+        return 1
+    total = (result.get("paging") or {}).get("total")
+    print(f"   OK. {total} results in category {ml_config['category']}")
+    print(
+        "\nClient Credentials works. Set only ML_CLIENT_ID and ML_CLIENT_SECRET as\n"
+        "repository secrets -- no browser step, no ML_REFRESH_TOKEN, no GH_PAT, and\n"
+        "the token-rotation steps in the workflow are unnecessary."
+    )
+    return 0
+
+
+def command_auth_login(args: argparse.Namespace) -> int:
+    """Authorize and exchange in one sitting, without a copy-paste gap.
+
+    MercadoLibre authorization codes expire in about 10 minutes and are single use.
+    Running --auth-url and --exchange-code as separate steps leaves a window in which
+    the code dies, and the resulting invalid_grant is indistinguishable from a real
+    misconfiguration. This does both halves back to back: it opens the browser, waits
+    for you to paste the redirect URL, and exchanges immediately.
+    """
+    client_id = os.environ.get("ML_CLIENT_ID")
+    client_secret = os.environ.get("ML_CLIENT_SECRET")
+    redirect = os.environ.get("ML_REDIRECT_URI")
+    if not client_id or not client_secret or not redirect:
+        print(
+            "error: ML_CLIENT_ID, ML_CLIENT_SECRET and ML_REDIRECT_URI must all be set",
+            file=sys.stderr,
+        )
+        return 2
+
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).decode("ascii").rstrip("=")
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .decode("ascii")
+        .rstrip("=")
+    )
+    state = secrets.token_urlsafe(16)
+    store_pkce(verifier, state)
+
+    query = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect,
+        "state": state,
+    }
+    if not args.no_pkce:
+        query["code_challenge"] = challenge
+        query["code_challenge_method"] = "S256"
+    url = f"https://auth.mercadolibre.com.ar/authorization?{urllib.parse.urlencode(query)}"
+
+    print("Opening the authorization page in your browser.")
+    print("Sign in as the ACCOUNT ADMINISTRATOR and approve.\n")
+    print(f"  {url}\n")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        print("(could not open a browser automatically; copy the URL above)")
+
+    print(
+        "You will land on a page that fails to load. That is expected.\n"
+        "Copy the ENTIRE address bar and paste it here, then press Enter:\n"
+    )
+    try:
+        pasted = input("redirect URL> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\naborted", file=sys.stderr)
+        return 130
+
+    if not pasted:
+        print("error: nothing pasted", file=sys.stderr)
+        return 2
+
+    returned_state = urllib.parse.parse_qs(urllib.parse.urlsplit(pasted).query).get("state", [None])[0]
+    if returned_state and returned_state != state:
+        print(
+            f"error: state mismatch. Expected {state}, got {returned_state}.\n"
+            "That URL is from a different authorization attempt. Re-run this command.",
+            file=sys.stderr,
+        )
+        return 2
+
+    code = clean_authorization_code(pasted)
+    fields = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "redirect_uri": redirect,
+    }
+    if not args.no_pkce:
+        fields["code_verifier"] = verifier
+
+    print("\nExchanging the code...")
+    payload = token_request(fields)
+    refresh = payload.get("refresh_token")
+    if not refresh:
+        print(
+            "error: MercadoLibre returned no refresh_token. The app is almost certainly\n"
+            f"missing the 'offline_access' scope. scope returned: {payload.get('scope')!r}",
+            file=sys.stderr,
+        )
+        return 1
+    store_refresh_token(str(refresh))
+    print(
+        json.dumps(
+            {
+                "scope": payload.get("scope"),
+                "user_id": payload.get("user_id"),
+                "access_token_expires_in_seconds": payload.get("expires_in"),
+                "refresh_token_saved_to": str(refresh_token_path()),
+            },
+            indent=2,
+        )
+    )
+    print("\nAuthorized. Now run: python3.13 fetch_ml.py --auth-check")
     return 0
 
 
@@ -695,14 +1004,33 @@ def parser() -> argparse.ArgumentParser:
     base.add_argument("--quiet", action="store_true")
     base.add_argument("--probe", action="store_true", help="check API reachability and category id, then exit")
     base.add_argument("--auth-check", action="store_true", help="determine which OAuth flow this app supports")
+    base.add_argument(
+        "--try-client-credentials",
+        action="store_true",
+        help="test the stateless client_credentials flow (no browser step needed if it works)",
+    )
+    base.add_argument(
+        "--auth-login",
+        action="store_true",
+        help="authorize and exchange in one step (recommended: no window for the code to expire)",
+    )
     base.add_argument("--auth-url", action="store_true", help="print the one-time browser authorization URL")
     base.add_argument("--exchange-code", help="exchange a one-time authorization code for tokens")
+    base.add_argument(
+        "--no-pkce",
+        action="store_true",
+        help="omit PKCE (use if the app does not have 'Requiere PKCE' enabled)",
+    )
     return base
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.try_client_credentials:
+            return command_try_client_credentials(args)
+        if args.auth_login:
+            return command_auth_login(args)
         if args.auth_check:
             return command_auth_check(args)
         if args.auth_url:

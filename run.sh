@@ -15,6 +15,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Load local configuration. A launchd job inherits almost no environment, so this is
+# the only place credentials come from on a scheduled run.
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
 # Pick an interpreter that can actually run this project.
 # hunter.py needs zoneinfo (Python 3.9+). A machine with Anaconda on the PATH often
 # resolves `python3` to an older base env, so probe rather than assume. Override with
@@ -48,8 +57,12 @@ TODAY="$($PYTHON -c 'import hunter; print(hunter.local_now().date().isoformat())
 echo "== 1/4 init history =="
 $PYTHON hunter.py init
 
-echo "== 2/4 discover (MercadoLibre public API) =="
-DISCOVERY="$($PYTHON fetch_ml.py)"
+# Discovery. The agentic sweep is the primary path: MercadoLibre's search API is closed
+# to third-party apps (a valid user token is still refused by their PolicyAgent), so the
+# ML client is kept only for the --probe/--auth-check diagnostics and for future
+# enrichment if that ever changes.
+echo "== 2/4 discover (public-web sweep) =="
+DISCOVERY="$($PYTHON sweep.py ${SWEEP_ARGS:-})"
 echo "$DISCOVERY"
 PACKET="$($PYTHON -c "import json,sys; print(json.loads(sys.argv[1])['packet'])" "$DISCOVERY")"
 
