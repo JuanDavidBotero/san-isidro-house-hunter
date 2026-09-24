@@ -1,12 +1,15 @@
-name: Daily radar (optional cloud path)
+name: Daily radar
 
-# NOTE: the primary schedule for this project is LOCAL, via ./install-schedule.sh
-# (launchd). This workflow is the optional cloud alternative and is not required.
+# This is the PRIMARY schedule. Discovery needs a web-search tool and open egress, and
+# the owner's work Mac has neither (no WebSearch in its Claude build, and its proxy
+# refuses general web traffic), so a runner is the only place the sweep actually works.
+# install-schedule.sh remains for a personal machine, where local is a fine choice.
 #
-# Differences from the local run:
-#   - sweep.py drives the `claude` CLI, which on a runner has no subscription to use,
-#     so this needs an ANTHROPIC_API_KEY secret. The local run uses your Claude Code
-#     subscription instead and needs no key.
+# Authentication, either one:
+#   CLAUDE_CODE_OAUTH_TOKEN  from `claude setup-token`, uses a subscription, no per-run
+#                            cost. Use a PERSONAL subscription, never a work-provided
+#                            one: this is personal house-hunting traffic.
+#   ANTHROPIC_API_KEY        metered, cents per run.
 #   - History must survive between runs or every listing is NEW every morning. Since
 #     .gitignore excludes data/*.sqlite3 and research/*.jsonl (they hold broker contact
 #     details), state is force-written to a dedicated `state` branch. `main` stays
@@ -60,7 +63,7 @@ jobs:
         run: python3 -c "import hunter, fetch_ml, notify, sweep; print('imports clean')"
 
       - name: Run tests
-        run: PYTHONPATH=.:tests python3 -m unittest test_hunter test_automation test_sweep
+        run: PYTHONPATH=.:tests python3 -m unittest test_hunter test_automation test_sweep test_review_fixes
 
       - name: Install the Claude CLI
         run: npm install -g @anthropic-ai/claude-code
@@ -70,28 +73,41 @@ jobs:
         # fresh runner has no Claude config, and the sweep is useless without a search
         # tool: WebFetch alone can only re-read URLs it already knows, so it cannot
         # DISCOVER anything. Verified here, loudly, before any real work.
+        #
+        # Two ways to authenticate, either is fine:
+        #   CLAUDE_CODE_OAUTH_TOKEN  a subscription token from `claude setup-token`.
+        #                            No per-run cost. Use a PERSONAL subscription, not a
+        #                            work-provided one.
+        #   ANTHROPIC_API_KEY        a metered API key. Costs cents per run.
         env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-            echo "::error::ANTHROPIC_API_KEY is not set. The cloud path needs it because" \
-                 "a runner has no Claude Code subscription. Add it under Settings ->" \
-                 "Secrets and variables -> Actions."
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::No Claude credential. Set ONE of these repository secrets:" \
+                 "CLAUDE_CODE_OAUTH_TOKEN (run 'claude setup-token' on a machine signed" \
+                 "in to a PERSONAL Claude subscription) or ANTHROPIC_API_KEY (metered," \
+                 "from console.anthropic.com)."
             exit 1
+          fi
+          if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            echo "authenticating with a subscription OAuth token"
+          else
+            echo "authenticating with a metered API key"
           fi
           OUT=$(claude -p 'List the tool names you can call right now, comma separated, nothing else.' \
                   --output-format text \
                   --allowedTools "WebSearch,WebFetch" \
-                  --permission-mode bypassPermissions 2>&1) || {
+                  --disallowedTools "Bash,Write,Edit,NotebookEdit,Task,Agent,Workflow" 2>&1) || {
             echo "::error::The Claude CLI failed to run. Output: $OUT"
             exit 1
           }
           echo "tools reported: $OUT"
           if ! printf '%s' "$OUT" | grep -qi "websearch"; then
             echo "::error::WebSearch is not available to the CLI on this runner. The sweep" \
-                 "cannot discover new listings with WebFetch alone. Check that the API key" \
-                 "is valid and that web search is enabled for the account."
+                 "cannot discover new listings with WebFetch alone, so it would report" \
+                 "'no listings' every day while appearing to work. Check the credential."
             exit 1
           fi
           echo "WebSearch confirmed available."
@@ -111,15 +127,10 @@ jobs:
       - name: Discover listings (public-web sweep)
         id: discover
         env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-            echo "::error::ANTHROPIC_API_KEY is not set. The cloud path needs it because" \
-                 "a runner has no Claude Code subscription. Either add the secret or use" \
-                 "the local launchd schedule instead (./install-schedule.sh)."
-            exit 1
-          fi
           python3 sweep.py --raw-output sweep-raw.txt | tee discover.json
           echo "packet=$(python3 -c "import json;print(json.load(open('discover.json'))['packet'])")" >> "$GITHUB_OUTPUT"
 
