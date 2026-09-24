@@ -1,0 +1,194 @@
+name: Daily radar
+
+# Unattended daily run: discover -> ingest -> report -> deliver -> persist state.
+#
+# STATE PERSISTENCE, and why it works the way it does:
+# .gitignore deliberately excludes data/*.sqlite3 and research/*.jsonl because they
+# carry broker contact details. But the whole freshness model depends on history
+# surviving between runs -- without it every listing is NEW every morning and the
+# alert becomes noise on day two.
+#
+# So state lives on a dedicated `state` branch, force-written by this job with
+# `git add -f`. `main` stays clean, the repo is private so nothing is exposed, and
+# git history gives a free audit trail of every price move.
+#
+# We deliberately do NOT use actions/cache for this: caches are evicted silently
+# after 7 days of no hits, and a silent eviction is indistinguishable from a real
+# flood of new discoveries. A branch either exists or it does not.
+
+on:
+  schedule:
+    # 11:00 UTC = 08:00 in Argentina (UTC-3, no DST). GitHub's scheduler is
+    # best-effort and often runs late under load; that is fine for a daily radar.
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Resolve routing and print the report without sending"
+        type: boolean
+        default: false
+      force_telegram:
+        description: "Send to Telegram even when there is no change"
+        type: boolean
+        default: false
+
+# Never let a manual run race the cron over the state branch.
+concurrency:
+  group: daily-radar
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Stdlib only, by design. Nothing to install, nothing to pin, nothing to break.
+      - name: Verify no dependencies are required
+        run: python3 -c "import hunter, fetch_ml, notify; print('imports clean')"
+
+      - name: Run tests
+        run: PYTHONPATH=.:tests python3 -m unittest test_hunter test_automation
+
+      - name: Restore radar history from the state branch
+        run: |
+          set -euo pipefail
+          if git fetch origin state --depth=1 2>/dev/null; then
+            # Only restore the state paths; never let the branch overwrite code.
+            git checkout origin/state -- data research reports 2>/dev/null || true
+            echo "Restored prior state."
+            ls -la data/ || true
+          else
+            echo "No state branch yet. This is the first run; history starts empty."
+          fi
+          python3 hunter.py init
+
+      - name: Seed the MercadoLibre refresh token
+        if: ${{ secrets.ML_REFRESH_TOKEN != '' }}
+        env:
+          ML_REFRESH_TOKEN: ${{ secrets.ML_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          # Never echo the token. Mask it so an accidental print cannot leak it.
+          echo "::add-mask::$ML_REFRESH_TOKEN"
+          printf '%s' "$ML_REFRESH_TOKEN" > data/ml_refresh_token
+          chmod 600 data/ml_refresh_token
+          # Keep a copy of what we started with, so the rotation step can detect a
+          # change by comparing files instead of interpolating a secret into bash.
+          cp data/ml_refresh_token data/ml_refresh_token.seeded
+          echo "Seeded refresh token (${#ML_REFRESH_TOKEN} chars)."
+
+      - name: Discover listings (MercadoLibre public API)
+        id: discover
+        env:
+          ML_CLIENT_ID: ${{ secrets.ML_CLIENT_ID }}
+          ML_CLIENT_SECRET: ${{ secrets.ML_CLIENT_SECRET }}
+          ML_REFRESH_TOKEN_FILE: data/ml_refresh_token
+        run: |
+          set -euo pipefail
+          python3 fetch_ml.py | tee discover.json
+          echo "packet=$(python3 -c "import json;print(json.load(open('discover.json'))['packet'])")" >> "$GITHUB_OUTPUT"
+
+      - name: Persist the rotated refresh token back to repository secrets
+        # MercadoLibre refresh tokens are SINGLE USE: the run above consumed the old
+        # one and received a replacement. If we do not store the replacement, tomorrow
+        # fails with invalid_grant and you must redo the browser authorization.
+        #
+        # It goes back as a repository secret rather than onto the state branch,
+        # because a live credential does not belong in git history even in a private
+        # repo. This needs a fine-grained PAT with "Secrets: write" on this repo,
+        # stored as GH_PAT -- the built-in GITHUB_TOKEN cannot write secrets.
+        #
+        # always(): the token may have rotated even if a later step failed, and losing
+        # a rotated token costs a manual browser re-authorization.
+        if: always() && hashFiles('data/ml_refresh_token') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          if cmp -s data/ml_refresh_token data/ml_refresh_token.seeded; then
+            echo "Token unchanged; nothing to update."
+            exit 0
+          fi
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::The MercadoLibre refresh token rotated but GH_PAT is not set," \
+                 "so it cannot be saved. Tomorrow's run WILL fail with invalid_grant." \
+                 "Create a fine-grained PAT with Secrets:write and add it as GH_PAT."
+            exit 1
+          fi
+          ROTATED="$(cat data/ml_refresh_token)"
+          echo "::add-mask::$ROTATED"
+          gh secret set ML_REFRESH_TOKEN --body "$ROTATED" --repo "${{ github.repository }}"
+          echo "Rotated refresh token saved to repository secrets."
+
+      - name: Ingest into persistent history
+        run: |
+          set -euo pipefail
+          PACKET="${{ steps.discover.outputs.packet }}"
+          if [ -s "$PACKET" ]; then
+            python3 hunter.py ingest --input "$PACKET"
+          else
+            echo "Empty packet; nothing to ingest. The report will fall through to NO CHANGE."
+          fi
+
+      - name: Build and deliver the report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          set -euo pipefail
+          TODAY=$(date -u +%F)
+          python3 notify.py \
+            --save "reports/${TODAY}.md" \
+            ${{ inputs.dry_run && '--dry-run' || '' }} \
+            ${{ inputs.force_telegram && '--force-telegram' || '' }}
+
+      - name: Show today's report in the run log
+        if: always()
+        run: cat "reports/$(date -u +%F).md" || echo "(no report written)"
+
+      - name: Persist state back to the state branch
+        if: success() && !inputs.dry_run
+        run: |
+          set -euo pipefail
+          git config user.name "san-isidro-radar"
+          git config user.email "radar@users.noreply.github.com"
+          git checkout -B state
+          # -f because these paths are gitignored for local hygiene; on this
+          # machine-owned branch we want them tracked.
+          git add -f data/*.sqlite3 research/*.jsonl reports/*.md 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state changes to persist."
+          else
+            git commit -m "state: radar run $(date -u +%F)"
+            git push --force origin state
+          fi
+
+      - name: Report a failed run to Telegram
+        # A silently dead radar is indistinguishable from a quiet market, which is
+        # the most dangerous failure mode this project has.
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 notify.py --force-telegram --text "⚠️ San Isidro radar FAILED on $(date -u +%F).
+          The daily run did not complete, so today's silence is NOT evidence that the market was quiet.
+          Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true

@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "MercadoLibre public-API discovery settings.",
+    "",
+    "These are the only values fetch_ml.py sends to the API. They are kept in config",
+    "rather than in code because category ids and attribute ids are MercadoLibre's to",
+    "change, not ours, and you should be able to correct them without editing Python.",
+    "",
+    "category: MLA1459 is Inmuebles (real estate) on site MLA (Argentina).",
+    "If a category id is wrong the API returns zero results rather than failing loudly,",
+    "so run `python3 fetch_ml.py --probe` after changing anything here.",
+    "",
+    "attribute_map: MercadoLibre returns facts as an `attributes` array of",
+    "{id, value_name, value_struct}. We read ONLY the ids listed here. An id that is",
+    "absent from a listing yields null, which the pipeline renders as 'Not verified.'",
+    "We never infer a missing attribute from the free-text description."
+  ],
+  "site": "MLA",
+  "category": "MLA1459",
+  "operation": "Venta",
+  "max_pages": 10,
+  "page_size": 50,
+  "request_delay_seconds": 1.0,
+  "user_agent": "san-isidro-house-hunter/1.0 (personal single-family home search; low volume; contact via repo)",
+  "search_terms": [
+    "casa san isidro jardin pileta",
+    "casa bajo san isidro",
+    "casa beccar jardin",
+    "casa lasalle san isidro"
+  ],
+  "attribute_map": {
+    "COVERED_AREA": "covered_m2",
+    "TOTAL_AREA": "total_m2",
+    "BEDROOMS": "bedrooms",
+    "ROOMS": null,
+    "FULL_BATHROOMS": "bathrooms",
+    "PARKING_LOTS": "parking",
+    "PROPERTY_TYPE": "property_type",
+    "MAINTENANCE_FEE": "expenses_ars",
+    "OPERATION": null,
+    "ITEM_CONDITION": "condition"
+  },
+  "boolean_attribute_map": {
+    "HAS_SWIMMING_POOL": "private_pool",
+    "HAS_GARDEN": "private_garden",
+    "HAS_PRIVATE_POOL": "private_pool",
+    "HAS_SECURITY": "controlled_entrance"
+  }
+}
