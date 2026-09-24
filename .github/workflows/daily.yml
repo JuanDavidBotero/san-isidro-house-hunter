@@ -6,10 +6,18 @@ name: Daily radar
 # install-schedule.sh remains for a personal machine, where local is a fine choice.
 #
 # Authentication, either one:
-#   CLAUDE_CODE_OAUTH_TOKEN  from `claude setup-token`, uses a subscription, no per-run
-#                            cost. Use a PERSONAL subscription, never a work-provided
-#                            one: this is personal house-hunting traffic.
-#   ANTHROPIC_API_KEY        metered, cents per run.
+#   ANTHROPIC_API_KEY        metered key from console.anthropic.com. The practical
+#                            choice here, and the one to use unless you have a personal
+#                            Claude subscription on a personal machine.
+#   CLAUDE_CODE_OAUTH_TOKEN  from `claude setup-token`, subscription-backed, no per-run
+#                            cost.
+#
+# NOTE, measured: `claude setup-token` does NOT work on an Apple-managed Claude Code
+# install. That build authenticates through Floodgate and has no claude.ai login, so it
+# cannot mint a subscription token at all. A token would also be a work credential and
+# does not belong in a personal repo. To use the token route, run setup-token from a
+# PERSONAL machine with the public @anthropic-ai/claude-code and a personal
+# Pro/Max subscription.
 #   - History must survive between runs or every listing is NEW every morning. Since
 #     .gitignore excludes data/*.sqlite3 and research/*.jsonl (they hold broker contact
 #     details), state is force-written to a dedicated `state` branch. `main` stays
