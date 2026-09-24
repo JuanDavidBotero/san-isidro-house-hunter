@@ -1,0 +1,14 @@
+# Local, cumulative radar state and research packets may contain broker contact details.
+data/*.sqlite3
+research/*.jsonl
+
+# MercadoLibre OAuth credentials. The refresh token is a live credential and is
+# rewritten on every run, since MercadoLibre invalidates it after a single use.
+data/ml_refresh_token
+data/ml_pkce.json
+
+__pycache__/
+tests/__pycache__/
+
+# Delivery and API credentials for local runs. Never commit these.
+.env

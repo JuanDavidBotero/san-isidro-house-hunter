@@ -1,0 +1,43 @@
+{
+  "price_ceiling_usd": 380000,
+  "price_investigate_ceiling_usd": 410000,
+  "ideal_price_usd": [240000, 300000],
+  "strong_price_usd": [300000, 350000],
+  "minimum_private_garden_m2": 120,
+  "maximum_small_development_units": 8,
+  "expenses_review_ars": 300000,
+  "expenses_reject_ars": 500000,
+  "rejected_micro_location_terms": [],
+  "negotiation_heuristic": {
+    "close_range_multipliers": [0.945, 0.973],
+    "opening_range_multipliers": [0.904, 0.918],
+    "round_to_usd": 1000
+  },
+  "priority_a_terms": [
+    "club nautico san isidro",
+    "club náutico san isidro",
+    "holy cross",
+    "bajo san isidro",
+    "lasalle",
+    "san isidro chico",
+    "los cardos",
+    "boating club",
+    "juan bautista de lasalle"
+  ],
+  "priority_b_terms": [
+    "lomas de san isidro",
+    "beccar vias",
+    "beccar vías",
+    "libertador",
+    "la horqueta"
+  ],
+  "exclusion_terms": {
+    "ph": 25,
+    "duplex": 20,
+    "dúplex": 20,
+    "a refaccionar": 25,
+    "a reciclar": 25,
+    "gran condominio": 30,
+    "barrio cerrado": 10
+  }
+}

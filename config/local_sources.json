@@ -1,0 +1,49 @@
+{
+  "pre_market_terms": [
+    "próximamente",
+    "proximamente",
+    "nuevo ingreso",
+    "ingreso",
+    "lanzamiento",
+    "obra nueva",
+    "en construcción",
+    "desarrollo"
+  ],
+  "sources": [
+    {
+      "name": "Rene Martin Propiedades",
+      "website": "https://www.renemartinprop.com/",
+      "phone": "+54 11 4723 2882",
+      "focus": "San Isidro / Lomas de San Isidro",
+      "social_url": null
+    },
+    {
+      "name": "Zárate Gestión Inmobiliaria",
+      "website": "https://zaratepropiedades.ar/",
+      "phone": "+54 11 4793 2605",
+      "focus": "San Isidro / Zona Norte",
+      "social_url": null
+    },
+    {
+      "name": "Morel Inmobiliaria",
+      "website": "https://www.morel.ar/",
+      "phone": "+54 11 6475 6933",
+      "focus": "San Isidro / Martínez",
+      "social_url": null
+    },
+    {
+      "name": "NARVAEZ Inmobiliaria",
+      "website": "https://www.narvaez.com.ar/",
+      "phone": "+54 11 4743 2090",
+      "focus": "San Isidro / Zona Norte",
+      "social_url": null
+    },
+    {
+      "name": "Varela Kramer Asesores Inmobiliarios",
+      "website": "https://www.varelakramer.com/",
+      "phone": "+54 11 3833 4554",
+      "focus": "San Isidro / Zona Norte",
+      "social_url": null
+    }
+  ]
+}
